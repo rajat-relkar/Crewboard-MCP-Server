@@ -7,6 +7,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
 
+from mcp_server.audit import AuditMiddleware, PermissionDenied, init_audit_db
 from mcp_server.database import (
     get_all_tasks,
     get_task,
@@ -33,9 +34,13 @@ auth = GitHubProvider(
     client_id=github_client_id,
     client_secret=github_client_secret,
     base_url=f"http://127.0.0.1:{PORT}",
+    # Least privilege: the server only needs the caller's username, so it asks GitHub
+    # for read-only profile access instead of the default "user" scope (read and write).
+    required_scopes=["read:user"],
 )
 
 mcp = FastMCP("MCP SERVER RR", auth=auth)
+mcp.add_middleware(AuditMiddleware())  # records every tool call in data/audit.db
 
 
 def current_user() -> str:
@@ -43,7 +48,7 @@ def current_user() -> str:
     token = get_access_token()
     login = token.claims.get("login") if token else None
     if not login:
-        raise ToolError("You must be logged in with GitHub to use this tool")
+        raise PermissionDenied("You must be logged in with GitHub to use this tool")
     return login
 
 
@@ -87,7 +92,7 @@ def update_task_status(task_id: TaskId, status: Status) -> Task:
     if task is None:
         raise ToolError(f"No task found with task_id {task_id!r}")
     if task.owner != user:
-        raise ToolError(
+        raise PermissionDenied(
             f"Task {task_id!r} belongs to {task.owner or 'nobody'}; only its owner can change its status"
         )
 
@@ -99,4 +104,5 @@ def update_task_status(task_id: TaskId, status: Status) -> Task:
 
 if __name__ == "__main__":
     init_db()  # make sure the tasks table exists before serving
+    init_audit_db()  # and the append-only audit_log table
     mcp.run(transport="http", port=PORT)  # blocks until the server is stopped

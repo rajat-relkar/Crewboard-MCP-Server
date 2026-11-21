@@ -1,6 +1,6 @@
 # Crewboard MCP Server
 
-> An end-to-end learning project for building an MCP server with GitHub OAuth 2.0 login, Pydantic validation, and persistent SQLite storage, then connecting Claude, Python, and LangChain clients to it.
+> An end-to-end learning project for building an MCP server with GitHub OAuth 2.0 login, Pydantic validation, an append-only audit log, and persistent SQLite storage, then connecting Claude, Python, and LangChain clients to it.
 
 ![Python 3.14+](https://img.shields.io/badge/Python-3.14%2B-3776AB?logo=python&logoColor=white)
 ![FastMCP](https://img.shields.io/badge/MCP-FastMCP-147D64)
@@ -11,7 +11,7 @@
 ![SQLite](https://img.shields.io/badge/Storage-SQLite-003B57?logo=sqlite&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-This repository demonstrates a practical MCP pattern: expose ordinary Python functions as tools, protect them with OAuth 2.0, validate every call with Pydantic, and persist the data in SQLite. The example is a small task manager with tools to create, list, and update tasks. Users log in with their GitHub account; every task records who created it, everyone who is logged in can see all tasks, and only a task's owner can change its status.
+This repository demonstrates a practical MCP pattern: expose ordinary Python functions as tools, protect them with OAuth 2.0, validate every call with Pydantic, and persist the data in SQLite. The example is a small task manager with tools to create, list, and update tasks. Users log in with their GitHub account; every task records who created it, everyone who is logged in can see all tasks, and only a task's owner can change its status. Every tool call, including refused and failed ones, is recorded in an append-only audit log.
 
 The same server is used by Claude Desktop, Claude Code, a Python FastMCP client, and a LangChain agent backed by a Groq model. Use it to learn how the pieces fit together, then adapt the server and tools to your own project. This is a local learning blueprint, not a production-ready service.
 
@@ -25,6 +25,7 @@ The same server is used by Claude Desktop, Claude Code, a Python FastMCP client,
 - [Optional: use the LangChain agent](#optional-use-the-langchain-agent)
 - [Project structure](#project-structure)
 - [Data model](#data-model)
+- [Audit log](#audit-log)
 - [Where login data is stored](#where-login-data-is-stored)
 - [Extend the blueprint](#extend-the-blueprint)
 - [Practical notes](#practical-notes)
@@ -35,9 +36,10 @@ The same server is used by Claude Desktop, Claude Code, a Python FastMCP client,
 ## What you will build
 
 - An HTTP MCP server built with [FastMCP](https://gofastmcp.com/), listening on `http://127.0.0.1:8083/mcp`.
-- **GitHub OAuth 2.0 login.** Requests without a valid token are rejected with `401 Unauthorized`. MCP clients discover the login endpoints automatically and open a browser for the user to sign in.
+- **GitHub OAuth 2.0 login.** Requests without a valid token are rejected with `401 Unauthorized`. MCP clients discover the login endpoints automatically and open a browser for the user to sign in. The server asks GitHub only for read-only profile access (`read:user`), because all it needs is the username.
 - **Pydantic validation.** Tool arguments are checked before a tool runs, and results are returned as typed models with a published JSON schema.
 - Three discoverable tools for managing tasks, with **per-user ownership**: all logged-in users see every task, but only the creator can change a task's status.
+- **Audit log.** Every tool call is written to `data/audit.db`: who called which tool, with which arguments, when, and whether it succeeded, was denied, or failed. Rows can be added but never changed or deleted.
 - A SQLite database that keeps tasks between server restarts.
 - Ready-made connections for Claude Desktop, Claude Code, a Python client, and a LangChain agent.
 
@@ -45,13 +47,14 @@ The same server is used by Claude Desktop, Claude Code, a Python FastMCP client,
 
 ![Application architecture: clients connect over HTTP with a Bearer token to the FastMCP server, which checks the token with GitHub, validates arguments with Pydantic, runs the task tools, and stores tasks in SQLite](application_architecture.png)
 
-A request passes through four layers, each in its own module:
+A request passes through five layers, each in its own module:
 
 | Layer | Module | Responsibility |
 |---|---|---|
 | Clients | `client.py`, `langchain_client.py`, Claude Desktop, Claude Code | Discover and call tools over HTTP, and run the browser login the first time they connect. |
 | Authentication | `server.py` (`GitHubProvider`) | Serves the OAuth endpoints, rejects requests without a valid token, and exposes the caller's GitHub username through `current_user()`. |
-| Validation and tools | `models.py`, `server.py` | Pydantic types describe and check every argument and result; the `@mcp.tool` functions apply the ownership rules. |
+| Audit | `audit.py` (`AuditMiddleware`) | Wraps every tool call and writes one row to `data/audit.db` with the caller, tool, arguments, outcome, and duration. |
+| Validation and tools | `models.py`, `server.py` | Pydantic types describe and check every argument and result; the `@mcp.tool` functions apply the ownership rules and raise `PermissionDenied` when a caller isn't allowed. |
 | Persistence | `database.py` | Reads and writes `data/tasks.db` and turns rows back into `Task` models. |
 
 ### Login flow (OAuth 2.0)
@@ -93,14 +96,20 @@ After the first login, clients that save their tokens (Claude Desktop through `m
 ```mermaid
 flowchart TD
     A["Client calls a tool on /mcp with a Bearer token"] --> B{"Token valid?"}
-    B -- "no" --> E1["401 Unauthorized"]
-    B -- "yes" --> C{"Arguments pass Pydantic validation?"}
+    B -- "no" --> E1["401 Unauthorized (never reaches a tool, so not audited)"]
+    B -- "yes" --> M["AuditMiddleware starts timing the call"]
+    M --> C{"Arguments pass Pydantic validation?"}
     C -- "no" --> E2["Validation error returned to the client"]
     C -- "yes" --> D["Tool runs and current_user() returns the GitHub username"]
     D --> F{"update_task_status: task exists and belongs to the caller?"}
-    F -- "no" --> E3["ToolError returned to the client"]
+    F -- "no such task" --> E3["ToolError returned to the client"]
+    F -- "someone else's task" --> E4["PermissionDenied returned to the client"]
     F -- "yes, or another tool" --> G["database.py reads or writes data/tasks.db"]
     G --> H["Result returned as a Task or TaskList model"]
+    E2 -- "outcome: error" --> L["AuditMiddleware writes one row to data/audit.db"]
+    E3 -- "outcome: error" --> L
+    E4 -- "outcome: denied" --> L
+    H -- "outcome: success" --> L
 ```
 
 ## Available tools
@@ -145,6 +154,8 @@ The rules live in `src/mcp_server/models.py`. FastMCP publishes them as the tool
 | Create a task | Any logged-in user; they become its owner |
 | List tasks | Any logged-in user; they see all tasks |
 | Change a task's status | Only the task's owner |
+
+Refused attempts raise `PermissionDenied`, and the [audit log](#audit-log) records them with the outcome `denied`.
 
 ## Quick start
 
@@ -194,7 +205,7 @@ GROQ_API_KEY="your_groq_api_key"   # only needed for the LangChain agent
 uv run python -m mcp_server.server
 ```
 
-Keep this terminal running. The server listens on `http://127.0.0.1:8083/mcp`. On startup it creates `data/tasks.db` and the `tasks` table if they are missing, and adds the `owner` column to databases created by older versions; there is no separate initialization step. If either GitHub variable is missing, the server stops with a message naming it.
+Keep this terminal running. The server listens on `http://127.0.0.1:8083/mcp`. On startup it creates `data/tasks.db` with the `tasks` table and `data/audit.db` with the `audit_log` table if they are missing, and adds the `owner` column to databases created by older versions; there is no separate initialization step. If either GitHub variable is missing, the server stops with a message naming it.
 
 ## Connect a client
 
@@ -308,12 +319,14 @@ The first run opens the browser login; later runs reuse the saved token. Ask som
 | Path | Purpose |
 |---|---|
 | `src/mcp_server/server.py` | FastMCP server, GitHub OAuth setup, `current_user()`, and the three tool definitions |
+| `src/mcp_server/audit.py` | `AuditMiddleware`, `PermissionDenied`, and the append-only `audit_log` table |
 | `src/mcp_server/models.py` | Pydantic field types and the `Task` and `TaskList` models |
 | `src/mcp_server/database.py` | SQLite initialization, the `owner` column migration, and task queries |
 | `src/mcp_server/client_auth.py` | OAuth helper for the Python clients, with tokens saved between runs |
 | `src/mcp_server/client.py` | FastMCP client examples for listing and calling tools |
 | `src/mcp_server/langchain_client.py` | Optional LangChain agent using a Groq model |
-| `data/tasks.db` | SQLite database file, created on first server start |
+| `data/tasks.db` | SQLite database of tasks, created on first server start |
+| `data/audit.db` | SQLite audit log, created on first server start |
 | `.env.example` | Names of the required settings: `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GROQ_API_KEY` |
 | `.mcp.json` | Claude Code connection to the local server |
 | `application_architecture.png` | The architecture diagram shown above |
@@ -339,6 +352,38 @@ Tasks with no owner are listed for everyone, but nobody can change their status.
 uv run python -c "import sqlite3; c = sqlite3.connect('data/tasks.db'); c.execute('UPDATE tasks SET owner = ? WHERE owner IS NULL', ('your-github-username',)); c.commit()"
 ```
 
+## Audit log
+
+`AuditMiddleware` in `src/mcp_server/audit.py` wraps every tool call and writes one row to the `audit_log` table in `data/audit.db`. The log is kept in its own database, apart from the tasks.
+
+| Column | Contents |
+|---|---|
+| `event_id` | A UUID for this event |
+| `occurred_at` | When the call arrived, in UTC (ISO 8601) |
+| `caller` | GitHub username of the caller, or `NULL` if the call had no GitHub identity |
+| `caller_id` | GitHub's numeric user ID. Unlike the username, it never changes, so it identifies the person even after a rename. |
+| `tool` | Name of the tool that was called |
+| `arguments` | The arguments exactly as sent, as JSON, before validation |
+| `outcome` | `success`, `denied` (the caller wasn't allowed), or `error` (invalid arguments, an unknown task, or a failure) |
+| `error` | The error message for `denied` and `error` events |
+| `duration_ms` | How long the call took |
+
+How the log is protected:
+
+- **Append-only.** Database triggers reject every `UPDATE` and `DELETE` on `audit_log`, so rows can't be changed or removed through SQL.
+- **No secrets.** Arguments whose names contain `token`, `secret`, `password`, `credential`, or `key` are stored as `[REDACTED]`. Text longer than 500 characters is shortened, so one oversized call can't bloat the log.
+- **Failures don't block tools.** If a row can't be written, the error is printed on the server console and the tool's result is still returned. A stricter setup would refuse the call instead.
+
+Only tool calls are recorded. Requests without a valid token are rejected with `401 Unauthorized` before they reach a tool, and listing the available tools isn't logged.
+
+To read the log, run this from the project root:
+
+```bash
+uv run python -c "import sqlite3; c = sqlite3.connect('data/audit.db'); [print(r) for r in c.execute('SELECT occurred_at, caller, tool, outcome, error FROM audit_log ORDER BY occurred_at')]"
+```
+
+Add `WHERE outcome = 'denied'` before `ORDER BY` to see only refused attempts. The log contains task titles and descriptions from the tool arguments, so treat it like the task data. To start over, stop the server and delete `data/audit.db`; it is recreated on the next start.
+
 ## Where login data is stored
 
 | What | Location | Notes |
@@ -353,7 +398,7 @@ uv run python -c "import sqlite3; c = sqlite3.connect('data/tasks.db'); c.execut
 Try extending the project in small steps:
 
 1. Describe any new inputs in `models.py` as `Annotated` types with `Field` constraints, so they are validated and documented automatically.
-2. Add a function decorated with `@mcp.tool` in `server.py`. Call `current_user()` if the tool needs to know who is calling, and raise `ToolError` to return a readable error.
+2. Add a function decorated with `@mcp.tool` in `server.py`. Call `current_user()` if the tool needs to know who is calling. Raise `PermissionDenied` when the caller isn't allowed, so the audit log records the attempt as `denied`, and `ToolError` for any other readable error. Every new tool is audited automatically.
 3. Add the corresponding database operation in `database.py`, returning `Task` models instead of raw rows.
 4. Call the new tool through `client.py` or the standalone example above.
 5. Ask the LangChain agent or Claude to use it.
@@ -365,9 +410,9 @@ Keeping authentication, validation, tool definitions, and persistence in separat
 - **Local use only.** The server uses plain HTTP on `127.0.0.1`. To deploy it, serve it over HTTPS, change `base_url` in `server.py` to the public URL, update both URLs in the GitHub OAuth app, and consider setting a fixed `jwt_signing_key` and shared `client_storage` on `GitHubProvider`.
 - **Anyone with a GitHub account can log in.** There is no allow-list. That is fine on `127.0.0.1`, but before exposing the server, add a check in `current_user()` that only accepts the usernames you expect.
 - **Everyone sees every task.** Do not store private information in task titles or descriptions.
-- **GitHub scope.** The server requests GitHub's `user` scope, which GitHub shows as "Personal user data: Full access". The server only needs the username; passing `required_scopes=["read:user"]` to `GitHubProvider` narrows this to read-only access.
+- **GitHub scope.** The server requests only `read:user`, read-only access to the user's profile, because it only needs the username. FastMCP's default is `user`, which GitHub shows as "Personal user data: Full access". Logins made while the server requested `user` are rejected, so after upgrading, each client must log in once more.
 - **Secrets.** Keep the client secret in `.env` only. If it is ever exposed, generate a new one in the GitHub OAuth app and update `.env`.
-- **The SQLite file is persistent local state.** Review its contents before publishing or sharing the repository.
+- **The SQLite files are persistent local state.** `data/tasks.db` and `data/audit.db` are listed in `.gitignore`. Review their contents before sharing them.
 - The database path is based on the project location, not the terminal's current working directory.
 - `list_tasks` returns an object (`{"count", "tasks"}`) rather than a bare list on purpose. FastMCP sends an empty list as no content at all, which some model APIs, including Groq's, reject as an empty tool message.
 - The demonstration calls in `client.py` create and update tasks, including task ID `1`. Review their inputs before running them against data you want to preserve; updates only succeed for tasks you own.
@@ -379,6 +424,7 @@ Keeping authentication, validation, tool definitions, and persistence in separat
 |---|---|
 | `GITHUB_CLIENT_ID is not set` when starting the server | Create `.env` in the repository root from `.env.example` and fill in both GitHub values. |
 | `401 Unauthorized` | The client has not logged in. In Claude Code run `/mcp` and choose **Authenticate**; other clients start the browser login automatically. |
+| `401 Unauthorized` or a login error about an invalid scope after upgrading | Older logins used the `user` scope; the server now requires `read:user`. Delete the client's saved login (see [Where login data is stored](#where-login-data-is-stored)) and log in again. |
 | GitHub shows "The redirect_uri is not associated with this application" | The OAuth app's callback URL must be exactly `http://127.0.0.1:8083/auth/callback`. |
 | The **Authorize** button on GitHub stays grey | Wait a few seconds with the tab focused and click an empty part of the page. If it stays disabled, reload, or open the page in a private window without extensions. |
 | The Python client's login times out | The client waits five minutes for the browser login. Run the script again and finish the login sooner. |
